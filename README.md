@@ -6,3 +6,8 @@ Simple web tic-tac-toe with user ratings
 
 <b>Done</b>: 
 - Added backend logic for login, register and maintaining sessions
+
+<b>TODO</b>:
+- Frontend
+- Game logic
+- Online multiplayer using websocket
