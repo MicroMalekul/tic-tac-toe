@@ -74,7 +74,7 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
-	tokenString, _ := newToken.SignedString(jwtKey)
+	tokenString, _ := newToken.SignedString([]byte(jwtKey))
 
 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
 
@@ -90,7 +90,7 @@ func Heartbeat(w http.ResponseWriter, r *http.Request) {
 	var tokenString string
 	fmt.Sscanf(header, "Bearer %s", &tokenString)
 	claims := &Claims{}
-	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) { return jwtKey, nil })
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) { return []byte(jwtKey), nil })
 
 	if err != nil || !token.Valid {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -105,7 +105,7 @@ func Heartbeat(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
-	tokenString, _ = newToken.SignedString(jwtKey)
+	tokenString, _ = newToken.SignedString([]byte(jwtKey))
 
 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
 
@@ -122,8 +122,13 @@ func Register(w http.ResponseWriter, r *http.Request) {
 	query := "SELECT username FROM users WHERE username=$1"
 
 	err = database.QueryRow(query, creds.Username).Scan(&exists)
-	if err != sql.ErrNoRows {
-		http.Error(w, "Bad request", http.StatusBadRequest)
+	if err != nil && err != sql.ErrNoRows {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if err == nil {
+		http.Error(w, "User already exists", http.StatusBadRequest)
+		return
 	}
 
 	query = "INSERT INTO users (username, password, wins) VALUES ($1, $2, 0)"
