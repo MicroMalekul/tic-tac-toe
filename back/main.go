@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -20,13 +22,17 @@ type Credentials struct {
 
 var database *sql.DB
 
-const jwtKey = "abObasN0w"
+var jwtKey = os.Getenv("JWT_KEY")
 
 func main() {
 	var err error
-	const connStrU string = "host=localhost user=tttapp password=abob4ik- dbname=tttdata sslmode=disable"
+	err = godotenv.Load("../.env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
 
-	database, err = sql.Open("postgres", connStrU)
+	connStr := fmt.Sprintf("host=localhost user=%s password=%s dbname=tttdata sslmode=disable", os.Getenv("DB_USERNAME"), os.Getenv("DB_PASSWORD"))
+	database, err = sql.Open("postgres", connStr)
 	if err != nil {
 		log.Fatal(err)
 		return
@@ -39,9 +45,17 @@ func main() {
 	defer database.Close()
 	http.HandleFunc("/login", Login)
 	http.HandleFunc("/register", Register)
-	http.HandleFunc("/heartbeat", Heartbeat)
+	http.HandleFunc("/heartbeat", GetAccessTokenHeartbeat)
+	http.HandleFunc("/logout", Logout)
 
 	http.ListenAndServe(":8080", nil)
+}
+
+type Claims struct {
+	User_id int    `json:"user_id"`
+	Version int    `json:"user_version"`
+	Type    string `json:"token_type"`
+	jwt.RegisteredClaims
 }
 
 func Login(w http.ResponseWriter, r *http.Request) {
@@ -51,12 +65,12 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-
-	query := "SELECT password FROM users WHERE username=$1"
+	query := "SELECT id, password FROM users WHERE username=$1"
 	var hash string
-	err = database.QueryRow(query, creds.Username).Scan(&hash)
+	var user_id int
+	err = database.QueryRow(query, creds.Username).Scan(&user_id, &hash)
 	if err != nil {
-		http.Error(w, "Not found", http.StatusNotFound)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -66,9 +80,18 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expirationTime := time.Now().Add(24 * time.Hour)
+	var version int
+	query = "UPDATE users SET user_version = user_version + 1 WHERE id=$1 RETURNING user_version"
+	err = database.QueryRow(query, user_id).Scan(&version)
+	if err != nil {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	expirationTime := time.Now().Add(30 * 24 * time.Hour)
 	newClaims := &Claims{
-		Username: creds.Username,
+		User_id: user_id,
+		Version: version,
+		Type:    "Refresh",
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
 		},
@@ -76,39 +99,68 @@ func Login(w http.ResponseWriter, r *http.Request) {
 	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
 	tokenString, _ := newToken.SignedString([]byte(jwtKey))
 
-	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
-
+	json.NewEncoder(w).Encode(map[string]string{"refresh_token": tokenString, "access_token": ""})
 }
 
-type Claims struct {
-	Username string `json:"username"`
-	jwt.RegisteredClaims
-}
-
-func Heartbeat(w http.ResponseWriter, r *http.Request) {
+func GetAccessTokenHeartbeat(w http.ResponseWriter, r *http.Request) {
 	header := r.Header.Get("Authorization")
-	var tokenString string
-	fmt.Sscanf(header, "Bearer %s", &tokenString)
+	var refreshTokenString string
+	fmt.Sscanf(header, "Bearer %s", &refreshTokenString)
 	claims := &Claims{}
-	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) { return []byte(jwtKey), nil })
+	refreshToken, err := jwt.ParseWithClaims(refreshTokenString, claims, func(token *jwt.Token) (any, error) { return []byte(jwtKey), nil })
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
 
-	if err != nil || !token.Valid {
+	query := "SELECT user_version FROM users WHERE id=$1"
+	var version int
+	err = database.QueryRow(query, claims.User_id).Scan(&version)
+	if err != nil || !refreshToken.Valid || version != claims.Version || claims.Type != "Refresh" {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	expirationTime := time.Now().Add(24 * time.Hour)
+	expirationTime := time.Now().Add(15 * time.Minute)
 	newClaims := &Claims{
-		Username: claims.Username,
+		User_id: claims.User_id,
+		Version: claims.Version,
+		Type:    "Access",
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
 		},
 	}
 	newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
-	tokenString, _ = newToken.SignedString([]byte(jwtKey))
+	accessTokenString, _ := newToken.SignedString([]byte(jwtKey))
 
-	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+	json.NewEncoder(w).Encode(map[string]string{"access_token": accessTokenString})
+}
 
+func Logout(w http.ResponseWriter, r *http.Request) {
+	header := r.Header.Get("Authorization")
+	var refreshTokenString string
+	fmt.Sscanf(header, "Bearer %s", &refreshTokenString)
+	claims := &Claims{}
+	refreshToken, err := jwt.ParseWithClaims(refreshTokenString, claims, func(token *jwt.Token) (interface{}, error) { return []byte(jwtKey), nil })
+	if err != nil || !refreshToken.Valid {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	query := "SELECT user_version FROM users WHERE id=$1"
+	var version int
+	err = database.QueryRow(query, claims.User_id).Scan(&version)
+
+	if (err != nil || !refreshToken.Valid) || version != claims.Version {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	query = "UPDATE users SET user_version = user_version + 1 WHERE id=$1"
+	_, err = database.Exec(query, claims.User_id)
+	if err != nil {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
 }
 
 func Register(w http.ResponseWriter, r *http.Request) {
@@ -131,10 +183,11 @@ func Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query = "INSERT INTO users (username, password, wins) VALUES ($1, $2, 0)"
+	query = "INSERT INTO users (username, password, wins, user_version) VALUES ($1, $2, 0, 1)"
 	hash, _ := bcrypt.GenerateFromPassword([]byte(creds.Password), bcrypt.DefaultCost)
 	_, err = database.Exec(query, creds.Username, hash)
 	if err != nil {
+		log.Fatal(err)
 		http.Error(w, "Register failed", http.StatusUnauthorized)
 		return
 	}
